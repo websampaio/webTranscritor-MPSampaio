@@ -1,12 +1,16 @@
 from pathlib import Path
 from faster_whisper import WhisperModel
 from docx import Document
+from docx.shared import Pt
 
 import streamlit as st
 import subprocess
 import platform
 import os
 import time
+
+# from streamlit.runtime.scriptrunner import add_script_run_ctx
+
 
 # ==========================================
 # CONFIGURAÇÕES
@@ -36,8 +40,6 @@ EXTENSOES_AUDIO = {
     ".m4a",
     ".aac"
 }
-
-inicio = time.time()
 
 
 # ==========================================
@@ -71,6 +73,19 @@ def carregar_modelo(
 # FUNÇÕES
 # ==========================================
 
+def formatar_tempo(segundos):
+
+    horas = int(segundos // 3600)
+    minutos = int((segundos % 3600) // 60)
+    segundos_restantes = int(segundos % 60)
+
+    return (
+        f"{horas:02d}:"
+        f"{minutos:02d}:"
+        f"{segundos_restantes:02d}"
+    )
+    
+    
 def salvar_upload(arquivo) -> Path:
 
     caminho = UPLOAD_DIR / arquivo.name
@@ -118,22 +133,98 @@ def transcrever_audio(
     texto_status
 ) -> str:
 
-    segmentos, info = modelo.transcribe(
+    inicio_transcricao = time.time()
+
+    segmentos_generator, info = modelo.transcribe(
         str(caminho_audio),
         language="pt",
-        beam_size=1 # 1=Muito rápida / 5=Mais lenta / 10=Pesada
+        beam_size=1,
+        vad_filter=True,
+        word_timestamps=True,
+        condition_on_previous_text=False
     )
+
+    # FORÇA processamento incremental
 
     duracao_total = info.duration
 
     texto_final = []
 
-    for segmento in segmentos:
+    participante_atual = 1
+    ultimo_fim = 0
 
-        texto_final.append(
-            segmento.text.strip()
-        )
-        
+    buffer_texto = []
+
+    inicio_bloco = 0
+
+
+    for segmento in segmentos_generator:
+    
+        texto = segmento.text.strip()
+
+        pausa = segmento.start - ultimo_fim
+
+        # ==========================================
+        # TROCA DE PARTICIPANTE
+        # ==========================================
+
+        if pausa > 2.0:
+
+            participante_atual += 1
+
+            if participante_atual > 2:
+                participante_atual = 1
+
+        # ==========================================
+        # INÍCIO DO BLOCO
+        # ==========================================
+
+        if not buffer_texto:
+            inicio_bloco = segmento.start
+
+        buffer_texto.append(texto)
+
+        ultimo_fim = segmento.end
+
+        # ==========================================
+        # FINALIZAR PARÁGRAFO
+        # ==========================================
+
+        finalizar = False
+
+        if texto.endswith((".", "!", "?")):
+            finalizar = True
+
+        if pausa > 3:
+            finalizar = True
+
+        # ==========================================
+        # GERAR BLOCO
+        # ==========================================
+
+        if finalizar:
+
+            inicio_txt = formatar_tempo(
+                inicio_bloco
+            )
+
+            fim_txt = formatar_tempo(
+                segmento.end
+            )
+
+            texto_bloco = " ".join(
+                buffer_texto
+            )
+
+            bloco = (
+                f"[{inicio_txt} → {fim_txt}]\n"
+                f"Participante {participante_atual}:\n"
+                f"{texto_bloco}\n"
+            )
+
+            texto_final.append(bloco)
+
+            buffer_texto = []
 
         # ==========================================
         # PROGRESSO
@@ -147,39 +238,10 @@ def transcrever_audio(
         porcentagem = int(
             progresso * 100
         )
-        
-
-        # ==========================================
-        # TEMPO RESTANTE
-        # ==========================================
-   
-        
-        tempo_restante = (
-            duracao_total - segmento.end
-        )
-
-        minutos = int(
-            tempo_restante // 60
-        )
-
-        segundos = int(
-            tempo_restante % 60
-        )
-        
-        
-        # ==========================================
-        # TEMPO DECORRIDO
-        # ==========================================
 
         tempo_decorrido = (
-            time.time() - inicio
+            time.time() - inicio_transcricao
         )
-
-        
-        
-        # ==========================================
-        # VELOCIDADE REALTIME
-        # ==========================================
 
         velocidade = (
             segmento.end / tempo_decorrido
@@ -187,11 +249,6 @@ def transcrever_audio(
             else 0
         )
 
-        
-        # ==========================================
-        # ETA REAL
-        # ==========================================
-        
         restante_audio = (
             duracao_total - segmento.end
         )
@@ -209,10 +266,9 @@ def transcrever_audio(
         eta_segundos = int(
             eta_real % 60
         )
-        
-        
+
         # ==========================================
-        # BARRA
+        # ATUALIZAR BARRA
         # ==========================================
 
         barra_progresso.progress(
@@ -220,23 +276,25 @@ def transcrever_audio(
             text=f"Transcrevendo: {porcentagem}%"
         )
 
-        texto_status.text(
-            f"🎙️ Processado: "
-            f"{segmento.end:.1f}s / "
-            f"{duracao_total:.1f}s\n"
-            
-            f"⏳ Tempo restante do áudio: "
-            f"{minutos:02d}:{segundos:02d}s\n"
+        # ==========================================
+        # ATUALIZAR STATUS
+        # ==========================================
 
-            f"⚡ Velocidade: "
-            f"{velocidade:.1f}x\n"
+        texto_status.markdown(
+            f"""
+            ### 🎙️ Status da Transcrição
+
+            **🎙️ Processado:** {segmento.end:.1f}s / {duracao_total:.1f}s
+
+            **⚡ Velocidade:** {velocidade:.1f}x 
             
-            f"⏳ Tempo restante do processo: "
-            f"{eta_minutos:02d}:"
-            f"{eta_segundos:02d}s"
+            **⏳ Tempo estimado do processo:** {eta_minutos:02d}:{eta_segundos:02d}
+            """
         )
-        
-    return " ".join(texto_final)
+
+        time.sleep(0.03)
+
+    return "\n".join(texto_final)
 
 
 def salvar_txt(nome: str, texto: str) -> Path:
@@ -257,12 +315,26 @@ def salvar_docx(nome: str, texto: str) -> Path:
 
     doc = Document()
 
-    doc.add_heading(
+    titulo = doc.add_heading(
         "Transcrição",
         level=1
     )
 
-    doc.add_paragraph(texto)
+    for linha in texto.split("\n"):
+
+        p = doc.add_paragraph()
+
+        run = p.add_run(linha)
+
+        run.font.size = Pt(11)
+
+        # timestamps em negrito
+        if linha.startswith("["):
+            run.bold = True
+
+        # participante em azul visual
+        if linha.startswith("Participante"):
+            run.bold = True
 
     doc.save(caminho)
 
@@ -359,27 +431,27 @@ if arquivo:
 
             st.stop()
 
-        with st.spinner("Transcrevendo com IA..."):
+        barra = st.progress(
+            0,
+            text=("Iniciando transcrição com IA...")
+        )
 
-            barra = st.progress(
-                0,
-                text="Iniciando transcrição..."
-            )
+        status_texto = st.empty()
 
-            status = st.empty()
+        texto = transcrever_audio(
+            caminho_audio,
+            barra,
+            status_texto
+        )
 
-            texto = transcrever_audio(
-                caminho_audio,
-                barra,
-                status
-            )
+        barra.progress(
+            100,
+            text="Transcrição concluída!"
+        )
 
-            barra.progress(
-                100,
-                text="Transcrição concluída!"
-            )
-
-            status.text("Processamento finalizado.")
+        status_texto.markdown(
+            "✅ Processamento finalizado."
+        )
 
         st.success("Transcrição concluída!")
 
@@ -440,3 +512,4 @@ if arquivo:
         st.error(
             f"Erro inesperado: {erro}"
         )
+        
